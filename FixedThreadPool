@@ -1,0 +1,82 @@
+import java.util.LinkedList;
+import java.util.List;
+
+class WorkerThread extends Thread {
+    private final List<Runnable> taskQueue;
+    private boolean isStopped = false;
+
+    public WorkerThread(List<Runnable> taskQueue) {
+        this.taskQueue = taskQueue;
+    }
+
+    public void run() {
+        while (!isStopped) {
+            Runnable task;
+            synchronized (taskQueue) {
+                while (taskQueue.isEmpty() && !isStopped) {
+                    try {
+                        taskQueue.wait();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                task = taskQueue.poll();
+            }
+
+            if (task != null) {
+                task.run();
+            }
+        }
+    }
+
+    public void stopThread() {
+        isStopped = true;
+        synchronized (taskQueue) {
+            taskQueue.notifyAll();
+        }
+    }
+}
+
+public class CustomThreadPool {
+    private final int poolSize;
+    private final List<WorkerThread> workers;
+    private final List<Runnable> taskQueue;
+
+    public CustomThreadPool(int poolSize) {
+        this.poolSize = poolSize;
+        this.workers = new LinkedList<>();
+        this.taskQueue = new LinkedList<>();
+
+        for (int i = 0; i < poolSize; i++) {
+            WorkerThread workerThread = new WorkerThread(taskQueue);
+            workers.add(workerThread);
+            workerThread.start();
+        }
+    }
+
+    public void submitTask(Runnable task) {
+        synchronized (taskQueue) {
+            taskQueue.add(task);
+            taskQueue.notify(); // Notify one of the waiting threads that a task is available.
+        }
+    }
+
+    public void shutdown() {
+        for (WorkerThread worker : workers) {
+            worker.stopThread();
+        }
+    }
+
+    public static void main(String[] args) {
+        CustomThreadPool threadPool = new CustomThreadPool(5);
+
+        for (int i = 0; i < 10; i++) {
+            final int taskId = i;
+            threadPool.submitTask(() -> {
+                System.out.println("Task " + taskId + " executed by thread " + Thread.currentThread().getName());
+            });
+        }
+
+        threadPool.shutdown();
+    }
+}
