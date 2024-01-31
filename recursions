@@ -1,0 +1,39 @@
+ public static String reverseString(String str) {
+        // Base case: if the string is empty or has only one character, it is already reversed
+        if (str.isEmpty() || str.length() == 1) {
+            return str;
+        } else {
+            // Recursive case: reverse the substring excluding the first character,
+            // and append the first character to the end
+            return reverseString(str.substring(1)) + str.charAt(0);
+        }
+
+
+
+ public static int factorial(int n) {
+        // Base case: factorial of 0 is 1
+        if (n == 0) {
+            return 1;
+        } else {
+            // Recursive case: n! = n * (n-1)!
+            return n * factorial(n - 1);
+        }
+    }
+
+
+
+ public static int fibonacci(int n) {
+        // Base cases: fibonacci(0) = 0, fibonacci(1) = 1
+        if (n == 0) {
+            return 0;
+        } else if (n == 1) {
+            return 1;
+        } else {
+            // Recursive case: fibonacci(n) = fibonacci(n-1) + fibonacci(n-2)
+            return fibonacci(n - 1) + fibonacci(n - 2);
+        }
+    }
+
+
+
+
