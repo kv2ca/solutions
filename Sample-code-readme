@@ -485,6 +485,23 @@ if (token == null) {
 }
 
 
+/ get access token silently (MSAL will refresh if needed)
+    public String acquireTokenSilently(ProxyToken proxyToken) throws Exception {
+        ConfidentialClientApplication cca = buildClient();
 
+        IAccount account = cca.getAccounts().join()
+                .stream()
+                .filter(a -> a.homeAccountId().equals(proxyToken.getAccountHomeId()))
+                .findFirst()
+                .orElseThrow(() -> new RuntimeException("Account not found in cache"));
+
+        SilentParameters parameters = SilentParameters.builder(
+                        Set.of(scope.split(" ")), account)
+                .build();
+
+        CompletableFuture<IAuthenticationResult> future = cca.acquireTokenSilently(parameters);
+        IAuthenticationResult result = future.get();
+        return result.accessToken();
+    }
 
 
