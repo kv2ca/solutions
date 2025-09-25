@@ -1,0 +1,490 @@
+server:
+  port: 8080
+
+spring:
+  redis:
+    host: localhost
+    port: 6379
+
+app:
+  azure:
+    tenant-id: <TENANT_ID>
+    client-id: <CLIENT_ID>
+    client-secret: ${AZURE_CLIENT_SECRET}
+    authority: https://login.microsoftonline.com/<TENANT_ID>
+    redirect-uri: https://your-spa/callback
+    scopes:
+      - openid
+      - profile
+      - offline_access
+      - api://<API_SCOPE>/access
+
+  proxy:
+    ttl-seconds: 3600
+    refresh-window-seconds: 60
+
+
+
+
+
+
+
+
+
+
+
+
+package com.example.bff.model;
+
+import lombok.Data;
+
+import java.io.Serializable;
+import java.util.List;
+
+@Data
+public class UserProfile implements Serializable {
+    private String sub;
+    private String name;
+    private String email;
+    private List<String> roles;
+    private List<String> groups;
+}
+
+
+
+
+
+
+
+
+package com.example.bff.model;
+
+import lombok.Data;
+
+import java.io.Serializable;
+
+@Data
+public class ProxyToken implements Serializable {
+    private String proxyToken;
+    private String accessToken;
+    private String refreshToken;
+    private long expiresAt;
+    private UserProfile userProfile;
+}
+
+
+
+
+
+
+
+package com.example.bff.service;
+
+import com.example.bff.model.ProxyToken;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.time.Duration;
+
+@Service
+@RequiredArgsConstructor
+public class RedisService {
+    private final RedisTemplate<String, Object> redisTemplate;
+
+    @Value("${app.proxy.ttl-seconds}")
+    private long ttl;
+
+    private String key(String proxyToken) {
+        return "proxy:" + proxyToken;
+    }
+
+    public void save(ProxyToken token) {
+        redisTemplate.opsForValue().set(key(token.getProxyToken()), token, Duration.ofSeconds(ttl));
+    }
+
+    public ProxyToken get(String proxyToken) {
+        Object o = redisTemplate.opsForValue().get(key(proxyToken));
+        return (o instanceof ProxyToken) ? (ProxyToken) o : null;
+    }
+
+    public void remove(String proxyToken) {
+        redisTemplate.delete(key(proxyToken));
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.example.bff.service;
+
+import com.microsoft.aad.msal4j.*;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.net.URI;
+import java.util.Set;
+
+@Component
+@RequiredArgsConstructor
+public class MsalClient {
+    @Value("${app.azure.client-id}") private String clientId;
+    @Value("${app.azure.client-secret}") private String clientSecret;
+    @Value("${app.azure.authority}") private String authority;
+    @Value("${app.azure.redirect-uri}") private String redirectUri;
+    @Value("${app.azure.scopes}") private Set<String> scopes;
+
+    private ConfidentialClientApplication buildCca() throws Exception {
+        IClientCredential cred = ClientCredentialFactory.createFromSecret(clientSecret);
+        return ConfidentialClientApplication.builder(clientId, cred).authority(authority).build();
+    }
+
+    public IAuthenticationResult exchangeAuthCode(String code, String codeVerifier) throws Exception {
+        var cca = buildCca();
+        var params = AuthorizationCodeParameters.builder(code, new URI(redirectUri))
+                .scopes(scopes)
+                .codeVerifier(codeVerifier)
+                .build();
+        return cca.acquireToken(params).get();
+    }
+
+    public IAuthenticationResult refresh(String refreshToken) throws Exception {
+        var cca = buildCca();
+        var params = RefreshTokenParameters.builder(scopes, refreshToken).build();
+        return cca.acquireToken(params).get();
+    }
+}
+
+
+
+
+
+
+package com.example.bff.service;
+
+import com.example.bff.model.ProxyToken;
+import com.example.bff.model.UserProfile;
+import com.microsoft.aad.msal4j.IAuthenticationResult;
+import com.nimbusds.jwt.JWTParser;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.Map;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AuthenticationService {
+    private final MsalClient msalClient;
+    private final RedisService redisService;
+
+    public ProxyToken login(String code, String codeVerifier) throws Exception {
+        var result = msalClient.exchangeAuthCode(code, codeVerifier);
+        return createProxyToken(result);
+    }
+
+    public ProxyToken refresh(ProxyToken token) throws Exception {
+        var result = msalClient.refresh(token.getRefreshToken());
+        token.setAccessToken(result.accessToken());
+        token.setRefreshToken(result.refreshToken());
+        token.setExpiresAt(result.expiresOnDate().toInstant().getEpochSecond());
+        redisService.save(token);
+        return token;
+    }
+
+    public ProxyToken validateOrRefresh(ProxyToken token, long refreshWindow) {
+        long now = Instant.now().getEpochSecond();
+        if (token.getExpiresAt() - now < refreshWindow) {
+            try {
+                log.debug("Refreshing token for proxyToken={}", token.getProxyToken());
+                return refresh(token);
+            } catch (Exception e) {
+                log.error("Failed to refresh token", e);
+                redisService.remove(token.getProxyToken());
+                return null;
+            }
+        }
+        return token;
+    }
+
+    private ProxyToken createProxyToken(IAuthenticationResult result) throws Exception {
+        var token = new ProxyToken();
+        token.setProxyToken(UUID.randomUUID().toString());
+        token.setAccessToken(result.accessToken());
+        token.setRefreshToken(result.refreshToken());
+        token.setExpiresAt(result.expiresOnDate().toInstant().getEpochSecond());
+        token.setUserProfile(parseUser(result.idToken()));
+        redisService.save(token);
+        return token;
+    }
+
+    private UserProfile parseUser(String idToken) {
+        var profile = new UserProfile();
+        try {
+            var jwt = JWTParser.parse(idToken);
+            Map<String,Object> claims = jwt.getJWTClaimsSet().getClaims();
+            profile.setSub((String) claims.get("sub"));
+            profile.setName((String) claims.get("name"));
+            profile.setEmail((String) claims.getOrDefault("preferred_username", claims.get("email")));
+        } catch (Exception e) {
+            log.warn("Failed to parse idToken", e);
+        }
+        return profile;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.example.bff.web;
+
+import com.example.bff.model.ProxyToken;
+import com.example.bff.service.AuthenticationService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+public class AuthController {
+    private final AuthenticationService authService;
+
+    public record LoginRequest(String code, String codeVerifier) {}
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestBody LoginRequest req) {
+        try {
+            ProxyToken token = authService.login(req.code(), req.codeVerifier());
+            return ResponseEntity.ok(Map.of("proxyToken", token.getProxyToken(),
+                                            "user", token.getUserProfile()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.example.bff.web;
+
+import com.example.bff.model.ProxyToken;
+import com.example.bff.service.AuthenticationService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+public class AuthController {
+    private final AuthenticationService authService;
+
+    public record LoginRequest(String code, String codeVerifier) {}
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestBody LoginRequest req) {
+        try {
+            ProxyToken token = authService.login(req.code(), req.codeVerifier());
+            return ResponseEntity.ok(Map.of("proxyToken", token.getProxyToken(),
+                                            "user", token.getUserProfile()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+package com.example.bff.web;
+
+import com.example.bff.model.ProxyToken;
+import com.example.bff.service.AuthenticationService;
+import com.example.bff.service.RedisService;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class ProxyTokenFilter extends OncePerRequestFilter {
+    private final RedisService redisService;
+    private final AuthenticationService authService;
+
+    @Value("${app.proxy.refresh-window-seconds}")
+    private long refreshWindow;
+
+   @Override
+protected void doFilterInternal(HttpServletRequest req, HttpServletResponse resp, FilterChain chain)
+        throws ServletException, IOException {
+    String path = req.getRequestURI();
+    if (path.startsWith("/api/auth") || path.startsWith("/public")) {
+        chain.doFilter(req, resp);
+        return;
+    }
+
+    String proxyTokenValue = extractBearer(req);
+    if (proxyTokenValue == null) {
+        resp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        return;
+    }
+
+    ProxyToken token = redisService.get(proxyTokenValue);
+    if (token == null) {
+        resp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        return;
+    }
+
+    token = authService.validateOrRefresh(token);  // <-- simplified
+    if (token == null) {
+        resp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        return;
+    }
+
+    req.setAttribute("userProfile", token.getUserProfile());
+    req.setAttribute("accessToken", token.getAccessToken());
+
+    chain.doFilter(req, resp);
+}
+
+    private String extractBearer(HttpServletRequest req) {
+        String auth = req.getHeader("Authorization");
+        if (auth != null && auth.startsWith("Bearer ")) {
+            return auth.substring(7);
+        }
+        return null;
+    }
+}
+
+
+
+
+
+
+
+package com.example.bff.config;
+
+import com.example.bff.web.ProxyTokenFilter;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@RequiredArgsConstructor
+public class SecurityConfig {
+    private final ProxyTokenFilter proxyTokenFilter;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.csrf().disable()
+            .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            .and()
+            .authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
+            .addFilterBefore(proxyTokenFilter,
+                org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+}
+
+
+
+
+
+
+
+public ProxyToken validateOrRefresh(ProxyToken token) {
+    long now = Instant.now().getEpochSecond();
+    if (token.getExpiresAt() <= now) {
+        try {
+            log.debug("Access token expired. Refreshing for proxyToken={}", token.getProxyToken());
+            return refresh(token);   // refresh using refresh token
+        } catch (Exception e) {
+            log.error("Failed to refresh token", e);
+            redisService.remove(token.getProxyToken());
+            return null;
+        }
+    }
+    return token;
+}
+
+
+
+
+
+public ProxyToken refresh(ProxyToken token) throws Exception {
+    var result = msalClient.refresh(token.getRefreshToken());
+    token.setAccessToken(result.accessToken());   // new access token
+    token.setRefreshToken(result.refreshToken()); // sometimes new refresh token
+    token.setExpiresAt(result.expiresOnDate().toInstant().getEpochSecond());
+    redisService.save(token);  // put updated token back in Redis
+    return token;
+}
+
+
+
+
+
+
+ProxyToken token = redisService.get(proxyTokenValue);
+if (token == null) {
+    resp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+    return;
+}
+
+token = authService.validateOrRefresh(token, refreshWindow);
+if (token == null) {
+    resp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+    return;
+}
+
+
+
+
+
