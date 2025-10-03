@@ -505,3 +505,22 @@ if (token == null) {
     }
 
 
+
+
+PublicClientApplication pca = PublicClientApplication.builder(clientId)
+        .authority(authority)
+        .httpClient(new IHttpClient() {
+            @Override
+            public IHttpResponse send(IHttpRequest request) {
+                System.out.println("MSAL Request URL: " + request.url());
+                System.out.println("MSAL Method: " + request.httpMethod());
+                System.out.println("MSAL Headers: " + request.headers());
+                if (request.body() != null) {
+                    System.out.println("MSAL Body: " + request.body());
+                }
+                return new DefaultHttpClient().send(request); // delegate to real client
+            }
+        })
+        .build();
+
+
