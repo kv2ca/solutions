@@ -1,3 +1,12 @@
+az ad app list --all --query "[].{Name:displayName, AppId:appId, Permissions:requiredResourceAccess, RedirectUris:replyUrls}" -o json
+
+
+Connect-MgGraph -Scopes "Application.Read.All"
+
+Get-MgApplication -All | Select-Object DisplayName, AppId, RequiredResourceAccess, RedirectUris
+
+
+
 server:
   port: 8080
 
