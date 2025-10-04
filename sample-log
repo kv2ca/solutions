@@ -7,11 +7,15 @@
         ));
 
 
-
 import com.microsoft.aad.msal4j.*;
 
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.List;
+import java.util.Map;
+
 public class LoggingHttpClient implements IHttpClient {
-    private final DefaultHttpClient delegate = new DefaultHttpClient();
 
     @Override
     public HttpResponse send(HttpRequest request) throws Exception {
@@ -22,15 +26,39 @@ public class LoggingHttpClient implements IHttpClient {
             System.out.println(new String(request.body()));
         }
 
-        HttpResponse response = delegate.send(request);
+        // Create connection
+        URL url = new URL(request.url());
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod(request.method());
+
+        // Set headers
+        for (Map.Entry<String, List<String>> header : request.headers().entrySet()) {
+            for (String value : header.getValue()) {
+                conn.setRequestProperty(header.getKey(), value);
+            }
+        }
+
+        // Send body if POST/PUT
+        if (request.body() != null) {
+            conn.setDoOutput(true);
+            conn.getOutputStream().write(request.body());
+        }
+
+        // Get response
+        int status = conn.getResponseCode();
+        InputStream is = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
+        byte[] responseBody = is != null ? is.readAllBytes() : null;
+
+        HttpResponse response = new HttpResponse(status, responseBody, conn.getHeaderFields());
 
         System.out.println("=== MSAL Response ===");
-        System.out.println(response.statusCode());
-        System.out.println(response.headers());
-        if (response.body() != null) {
-            System.out.println(new String(response.body()));
+        System.out.println(status);
+        System.out.println(conn.getHeaderFields());
+        if (responseBody != null) {
+            System.out.println(new String(responseBody));
         }
 
         return response;
     }
 }
+
