@@ -1,0 +1,7 @@
+       // 🔹 Enable MSAL internal logging here
+        com.microsoft.aad.msal4j.Logger msalLogger = new com.microsoft.aad.msal4j.Logger();
+        msalLogger.setLoggingOptions(new LoggingOptions(
+            LogLevel.VERBOSE,   // Verbose = detailed logging
+            true,               // PII enabled (you’ll see user and token info)
+            true                // Use default logger (stdout)
+        ));
