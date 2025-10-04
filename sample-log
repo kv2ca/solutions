@@ -62,3 +62,36 @@ public class LoggingHttpClient implements IHttpClient {
     }
 }
 
+
+
+
+
+
+
+// Simple implementation of HttpResponse for MSAL4J
+class SimpleHttpResponse implements HttpResponse {
+    private final int statusCode;
+    private final byte[] body;
+    private final Map<String, List<String>> headers;
+
+    public SimpleHttpResponse(int statusCode, byte[] body, Map<String, List<String>> headers) {
+        this.statusCode = statusCode;
+        this.body = body;
+        this.headers = headers;
+    }
+
+    @Override
+    public int statusCode() {
+        return statusCode;
+    }
+
+    @Override
+    public Map<String, List<String>> headers() {
+        return headers;
+    }
+
+    @Override
+    public byte[] body() {
+        return body;
+    }
+}
