@@ -23,3 +23,28 @@ public static String normalizeMessage(String input) {
 
     return normalized;
 }
+
+
+
+
+   public RedisTemplate<String, List<Student>> studentRedisTemplate(
+            RedisConnectionFactory connectionFactory) {
+        
+        RedisTemplate<String, List<Student>> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+        
+        // Create ObjectMapper
+        ObjectMapper objectMapper = new ObjectMapper();
+        
+        // Create serializer for List<Student> specifically
+        JavaType listType = objectMapper.getTypeFactory()
+            .constructCollectionType(List.class, Student.class);
+        
+        Jackson2JsonRedisSerializer<List<Student>> serializer = 
+            new Jackson2JsonRedisSerializer<>(objectMapper, listType);
+        
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(serializer);
+        
+        template.afterPropertiesSet();
+        return template;
