@@ -1,4 +1,8 @@
 
+
+"JAVA_OPTS" = "-Dspring.cloud.config.tls.enabled=false -Dspring.profiles.active=dev,esp_ccd01"
+
+
 keytool -list -keystore $JAVA_HOME/lib/security/cacerts -storepass changeit | grep -i "td"
 ```
 
