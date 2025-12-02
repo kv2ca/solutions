@@ -1,3 +1,9 @@
+as_site_config = {
+  # For SIT, add cache clearing
+  app_command_line = "rm -rf node_modules .angular && npm cache clean --force && npm install && npm run build && npx serve -s dist/wpui/browser -l $PORT"
+}
+
+
 import java.text.Normalizer;
 
 public static String normalizeMessage(String input) {
