@@ -1,9 +1,9 @@
-as_site_config = {
-  # For SIT, add cache clearing
-  app_command_line = "rm -rf node_modules .angular && npm cache clean --force && npm install && npm run build && npx serve -s dist/wpui/browser -l $PORT"
-}
-
-
+spring.config.import=
+spring.cloud.config.client.oauth2.enabled=
+spring.cloud.config.client.oauth2.client-id=
+spring.cloud.config.client.oauth2.client-secret=
+spring.cloud.config.client.oauth2.access-token-uri=
+spring.cloud.config.client.oauth2.scope=
 import java.text.Normalizer;
 
 public static String normalizeMessage(String input) {
