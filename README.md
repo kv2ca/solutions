@@ -4,7 +4,14 @@ spring.cloud.config.client.oauth2.client-id=
 spring.cloud.config.client.oauth2.client-secret=
 spring.cloud.config.client.oauth2.access-token-uri=
 spring.cloud.config.client.oauth2.scope=
+
+
+logging.level.org.springframework.cloud.config.client.OAuth2ConfigClientProperties=TRACE
+logging.level.org.springframework.cloud.config.client.ConfigClientOAuth2ResourceDetails=TRACE
+
 import java.text.Normalizer;
+
+
 
 public static String normalizeMessage(String input) {
     // Step 1: Normalize to decompose accented letters (é → e + ́)
