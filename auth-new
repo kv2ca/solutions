@@ -1,0 +1,583 @@
+https://claude.ai/public/artifacts/2a1ca49a-01ce-4663-a48c-503bba582f47
+
+
+
+// ============================================================================
+// COMPLETE BFF OAUTH2 FLOW - CORRECTED ENDPOINT SEQUENCE
+// ============================================================================
+/*
+ACTUAL ENDPOINT CALL SEQUENCE (Based on Screenshots):
+
+1. UI -> BFF: GET /wpbff/auth/start
+   Returns: {authorizationUrl, proxyToken}
+   UI stores proxyToken in sessionStorage
+
+2. UI redirects user to authorizationUrl (Microsoft login page)
+   User enters credentials at Microsoft
+
+3. Microsoft -> UI: Redirects to https://your-ui.com/auth/callback?code=XXX&state=YYY
+   (Microsoft redirects to UI, NOT to BFF!)
+   UI retrieves proxyToken from sessionStorage
+
+4. UI -> BFF: POST /wpbff/authorize
+   Body: {code: XXX, state: YYY, proxyToken: ZZZ}
+   (UI sends all three parameters!)
+   BFF exchanges code for tokens, stores in Redis
+   Returns: {success: true}
+
+5. UI -> BFF: GET /wpui/some-api
+   Header: X-Proxy-Token: ZZZ
+   BFF retrieves tokens from Redis, calls backend API
+   Returns: API data
+
+6. UI -> BFF: POST /wpui/logout
+   Header: X-Proxy-Token: ZZZ
+   BFF deletes session from Redis
+*/
+
+// ============================================================================
+// 1. MODELS
+// ============================================================================
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+class ImportantValues implements Serializable {
+    private String state;
+    private String nonce;
+    private String codeVerifier;
+    private String codeChallenge;
+    private String proxyToken;
+}
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+class UserSession implements Serializable {
+    private String accessToken;
+    private String idToken;
+    private String refreshToken;
+    private Long expiresIn;
+    private String username;
+    private String email;
+}
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+class AuthCallbackRequest {
+    private String code;
+    private String state;
+    private String proxyToken;
+}
+
+// ============================================================================
+// 2. REDIS SERVICE
+// ============================================================================
+@Service
+class RedisService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    
+    public void saveImportantValues(String proxyToken, ImportantValues values) {
+        redisTemplate.opsForValue().set("important:" + proxyToken, values, 300, TimeUnit.SECONDS);
+    }
+    
+    public ImportantValues getImportantValues(String proxyToken) {
+        return (ImportantValues) redisTemplate.opsForValue().get("important:" + proxyToken);
+    }
+    
+    public void deleteImportantValues(String proxyToken) {
+        redisTemplate.delete("important:" + proxyToken);
+    }
+    
+    public void saveUserSession(String proxyToken, UserSession session) {
+        redisTemplate.opsForValue().set("session:" + proxyToken, session, 3600, TimeUnit.SECONDS);
+    }
+    
+    public UserSession getUserSession(String proxyToken) {
+        return (UserSession) redisTemplate.opsForValue().get("session:" + proxyToken);
+    }
+    
+    public void deleteSession(String proxyToken) {
+        redisTemplate.delete("session:" + proxyToken);
+    }
+}
+
+// ============================================================================
+// 3. PKCE UTILITY
+// ============================================================================
+@Component
+class PKCEUtil {
+    
+    public String generateCodeVerifier() {
+        SecureRandom random = new SecureRandom();
+        byte[] bytes = new byte[96];  // 96 bytes = 128 base64 characters
+        random.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+    
+    public String generateCodeChallenge(String verifier) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(verifier.getBytes(StandardCharsets.US_ASCII));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(hash);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to generate code challenge", e);
+        }
+    }
+}
+
+// ============================================================================
+// 4. ENDPOINT 1: START LOGIN
+// ============================================================================
+@RestController
+@RequestMapping("/wpbff")
+@Slf4j
+class LoginController {
+    
+    @Autowired private RedisService redis;
+    @Autowired private PKCEUtil pkce;
+    
+    @Value("${azure.client-id}") private String clientId;
+    @Value("${azure.tenant-id}") private String tenantId;
+    @Value("${azure.redirect-uri}") private String redirectUri;
+    
+    /**
+     * ENDPOINT 1: UI calls this to start login
+     * GET /wpbff/auth/start
+     * 
+     * Returns: {authorizationUrl, proxyToken}
+     * UI stores proxyToken in sessionStorage
+     */
+    @GetMapping("/auth/start")
+    public ResponseEntity<Map<String, String>> startLogin() {
+        
+        log.info("Starting login flow");
+        
+        // Generate PKCE parameters
+        String codeVerifier = pkce.generateCodeVerifier();
+        String codeChallenge = pkce.generateCodeChallenge(codeVerifier);
+        
+        // Generate security tokens
+        String state = UUID.randomUUID().toString();
+        String nonce = UUID.randomUUID().toString();
+        String proxyToken = UUID.randomUUID().toString();
+        
+        // Store in Redis - ONLY ONE ENTRY
+        // Key: important:{proxyToken}
+        // Value: ImportantValues containing state, nonce, code_verifier, code_challenge
+        ImportantValues values = new ImportantValues(state, nonce, codeVerifier, codeChallenge, proxyToken);
+        redis.saveImportantValues(proxyToken, values);
+        
+        log.info("Stored ImportantValues in Redis with key: important:{}", proxyToken);
+        log.info("Generated state: {}", state);
+        
+        // Build Microsoft authorization URL
+        // IMPORTANT: redirect_uri points to UI, not BFF!
+        String authUrl = String.format(
+            "https://login.microsoftonline.com/%s/oauth2/v2.0/authorize?" +
+            "client_id=%s&response_type=code&redirect_uri=%s&response_mode=query&" +
+            "scope=openid profile email User.Read&state=%s&nonce=%s&" +
+            "code_challenge=%s&code_challenge_method=S256&prompt=select_account",
+            tenantId, clientId, urlEncode(redirectUri), state, nonce, codeChallenge
+        );
+        
+        log.info("Generated authorization URL with redirect_uri: {}", redirectUri);
+        log.info("Returning proxyToken to UI: {} (UI will store in sessionStorage)", proxyToken);
+        
+        return ResponseEntity.ok(Map.of(
+            "authorizationUrl", authUrl,
+            "proxyToken", proxyToken
+        ));
+    }
+    
+    private String urlEncode(String value) {
+        try {
+            return URLEncoder.encode(value, "UTF-8");
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+
+// ============================================================================
+// 5. ENDPOINT 2: HANDLE CALLBACK FROM UI
+// ============================================================================
+@RestController
+@RequestMapping("/wpbff")
+@Slf4j
+class CallbackController {
+    
+    @Autowired private RedisService redis;
+    @Autowired private ConfidentialClientApplication msalApp;
+    
+    @Value("${azure.redirect-uri}") private String redirectUri;
+    
+    /**
+     * ENDPOINT 2: UI calls this after receiving callback from Microsoft
+     * 
+     * Flow:
+     * 1. Microsoft redirects to: https://your-ui.com/auth/callback?code=XXX&state=YYY
+     * 2. UI intercepts this in Angular route
+     * 3. UI extracts code and state from URL
+     * 4. UI retrieves proxyToken from sessionStorage
+     * 5. UI calls THIS endpoint: POST /wpbff/authorize
+     *    Body: {code: XXX, state: YYY, proxyToken: ZZZ}
+     */
+    @PostMapping("/authorize")
+    public ResponseEntity<?> handleCallback(@RequestBody AuthCallbackRequest request) {
+        
+        log.info("Received callback from UI");
+        log.info("ProxyToken: {}", request.getProxyToken());
+        log.info("State: {}", request.getState());
+        log.info("Code: {}...", request.getCode().substring(0, Math.min(10, request.getCode().length())));
+        
+        try {
+            // Validate proxyToken exists
+            if (request.getProxyToken() == null || request.getProxyToken().isEmpty()) {
+                log.error("ProxyToken missing in request");
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("error", "proxyToken is required"));
+            }
+            
+            // Get stored ImportantValues from Redis using proxyToken
+            ImportantValues values = redis.getImportantValues(request.getProxyToken());
+            
+            if (values == null) {
+                log.error("ImportantValues not found for proxyToken: {}", request.getProxyToken());
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("error", "Invalid or expired session"));
+            }
+            
+            // Validate state matches (CSRF protection)
+            if (!request.getState().equals(values.getState())) {
+                log.error("State mismatch! Expected: {}, Got: {}", values.getState(), request.getState());
+                redis.deleteImportantValues(request.getProxyToken());
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("error", "State validation failed - possible CSRF attack"));
+            }
+            
+            log.info("State validated successfully");
+            
+            // Exchange authorization code for tokens using MSAL4J
+            AuthorizationCodeParameters params = AuthorizationCodeParameters
+                .builder(request.getCode(), new URI(redirectUri))
+                .codeVerifier(values.getCodeVerifier())  // PKCE code_verifier from Redis
+                .scopes(Collections.singleton("openid profile email User.Read"))
+                .build();
+            
+            log.info("Exchanging authorization code for tokens...");
+            IAuthenticationResult result = msalApp.acquireToken(params).get(30, TimeUnit.SECONDS);
+            log.info("Token exchange successful");
+            
+            // Validate nonce in ID token (replay protection)
+            if (!validateNonce(result.idToken(), values.getNonce())) {
+                log.error("Nonce validation failed");
+                redis.deleteImportantValues(request.getProxyToken());
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("error", "Nonce validation failed - possible replay attack"));
+            }
+            
+            log.info("Nonce validated successfully");
+            
+            // Extract user information from ID token
+            Map<String, Object> claims = parseIdToken(result.idToken());
+            String username = (String) claims.get("preferred_username");
+            String email = (String) claims.getOrDefault("email", username);
+            
+            log.info("User authenticated: {}", username);
+            
+            // Create user session
+            UserSession session = new UserSession(
+                result.accessToken(),
+                result.idToken(),
+                result.refreshToken(),
+                (long) result.expiresIn(),
+                username,
+                email
+            );
+            
+            // Store session in Redis with proxyToken as key (1 hour TTL)
+            redis.saveUserSession(request.getProxyToken(), session);
+            log.info("User session stored in Redis: session:{}", request.getProxyToken());
+            
+            // Clean up - delete ImportantValues (one-time use)
+            redis.deleteImportantValues(request.getProxyToken());
+            log.info("Deleted ImportantValues from Redis");
+            
+            // Return success to UI
+            return ResponseEntity.ok(Map.of(
+                "success", true,
+                "username", username,
+                "email", email
+            ));
+            
+        } catch (Exception e) {
+            log.error("Authentication failed", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", "Authentication failed: " + e.getMessage()));
+        }
+    }
+    
+    /**
+     * Validate nonce in ID token matches expected nonce
+     */
+    private boolean validateNonce(String idToken, String expectedNonce) {
+        try {
+            Map<String, Object> claims = parseIdToken(idToken);
+            String actualNonce = (String) claims.get("nonce");
+            return expectedNonce.equals(actualNonce);
+        } catch (Exception e) {
+            log.error("Failed to validate nonce", e);
+            return false;
+        }
+    }
+    
+    /**
+     * Parse JWT ID token and extract claims
+     */
+    private Map<String, Object> parseIdToken(String idToken) throws Exception {
+        String[] parts = idToken.split("\\.");
+        if (parts.length != 3) {
+            throw new IllegalArgumentException("Invalid ID token format");
+        }
+        String payload = new String(Base64.getUrlDecoder().decode(parts[1]));
+        return new ObjectMapper().readValue(payload, Map.class);
+    }
+}
+
+// ============================================================================
+// 6. ENDPOINT 3: PROTECTED API CALLS
+// ============================================================================
+@RestController
+@RequestMapping("/wpui")
+@Slf4j
+class ApiController {
+    
+    @Autowired private RedisService redis;
+    @Autowired private RestTemplate restTemplate;
+    
+    /**
+     * ENDPOINT 3: UI calls this for protected data
+     * GET /wpui/some-api
+     * Header: X-Proxy-Token: {proxyToken}
+     */
+    @GetMapping("/some-api")
+    public ResponseEntity<?> getSomeData(@RequestHeader("X-Proxy-Token") String proxyToken) {
+        
+        log.info("API call with proxyToken: {}", proxyToken);
+        
+        // Get session from Redis
+        UserSession session = redis.getUserSession(proxyToken);
+        if (session == null) {
+            log.error("Invalid or expired session for proxyToken: {}", proxyToken);
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(Map.of("error", "Invalid or expired session"));
+        }
+        
+        log.info("Session found for user: {}", session.getUsername());
+        
+        // Call backend API with access token
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(session.getAccessToken());
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> entity = new HttpEntity<>(headers);
+        
+        try {
+            ResponseEntity<String> response = restTemplate.exchange(
+                "https://backend-api.com/resource",
+                HttpMethod.GET,
+                entity,
+                String.class
+            );
+            
+            log.info("Backend API call successful");
+            return ResponseEntity.ok(response.getBody());
+            
+        } catch (HttpClientErrorException e) {
+            if (e.getStatusCode() == HttpStatus.UNAUTHORIZED) {
+                log.warn("Access token expired for user: {}", session.getUsername());
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("error", "Token expired, please login again"));
+            }
+            log.error("Backend API error", e);
+            throw e;
+        }
+    }
+    
+    /**
+     * ENDPOINT 4: Logout
+     * POST /wpui/logout
+     * Header: X-Proxy-Token: {proxyToken}
+     */
+    @PostMapping("/logout")
+    public ResponseEntity<?> logout(@RequestHeader("X-Proxy-Token") String proxyToken) {
+        log.info("Logging out proxyToken: {}", proxyToken);
+        
+        UserSession session = redis.getUserSession(proxyToken);
+        if (session != null) {
+            log.info("Logging out user: {}", session.getUsername());
+        }
+        
+        redis.deleteSession(proxyToken);
+        
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "Logged out successfully"
+        ));
+    }
+}
+
+// ============================================================================
+// 7. CONFIGURATION
+// ============================================================================
+@Configuration
+class AppConfig {
+    
+    @Value("${azure.client-id}")
+    private String clientId;
+    
+    @Value("${azure.client-secret}")
+    private String clientSecret;
+    
+    @Value("${azure.tenant-id}")
+    private String tenantId;
+    
+    @Bean
+    public ConfidentialClientApplication msalApp() throws Exception {
+        return ConfidentialClientApplication.builder(
+            clientId,
+            ClientCredentialFactory.createFromSecret(clientSecret))
+            .authority("https://login.microsoftonline.com/" + tenantId)
+            .build();
+    }
+    
+    @Bean
+    public RestTemplate restTemplate() {
+        return new RestTemplate();
+    }
+    
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        return template;
+    }
+}
+
+// ============================================================================
+// 8. APPLICATION.YML
+// ============================================================================
+/*
+azure:
+  client-id: your-azure-client-id
+  client-secret: your-azure-client-secret
+  tenant-id: your-azure-tenant-id
+  # IMPORTANT: This should be your UI callback URL, not BFF!
+  redirect-uri: https://your-ui.com/auth/callback
+
+spring:
+  redis:
+    host: your-redis.redis.cache.windows.net
+    port: 6380
+    password: your-redis-password
+    ssl: true
+    timeout: 2000ms
+*/
+
+// ============================================================================
+// 9. ANGULAR UI CODE (For Reference)
+// ============================================================================
+/*
+// auth.service.ts
+export class AuthService {
+  
+  // Step 1: Start login
+  async startLogin() {
+    const response = await fetch('https://your-bff.com/wpbff/auth/start');
+    const data = await response.json();
+    
+    // Store proxyToken in sessionStorage
+    sessionStorage.setItem('proxyToken', data.proxyToken);
+    
+    // Redirect to Microsoft
+    window.location.href = data.authorizationUrl;
+  }
+  
+  // Step 2: Handle callback (in auth-callback.component.ts)
+  async handleCallback(code: string, state: string) {
+    // Get proxyToken from sessionStorage
+    const proxyToken = sessionStorage.getItem('proxyToken');
+    
+    // Send all three to BFF
+    const response = await fetch('https://your-bff.com/wpbff/authorize', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code, state, proxyToken})
+    });
+    
+    const result = await response.json();
+    if (result.success) {
+      // Login successful, navigate to home
+      this.router.navigate(['/home']);
+    }
+  }
+  
+  // Step 3: Call protected API
+  async callApi() {
+    const proxyToken = sessionStorage.getItem('proxyToken');
+    
+    const response = await fetch('https://your-bff.com/wpui/some-api', {
+      headers: {'X-Proxy-Token': proxyToken}
+    });
+    
+    return await response.json();
+  }
+}
+
+// auth-callback.component.ts
+export class AuthCallbackComponent implements OnInit {
+  ngOnInit() {
+    // Extract code and state from URL
+    const urlParams = new URLSearchParams(window.location.search);
+    const code = urlParams.get('code');
+    const state = urlParams.get('state');
+    
+    if (code && state) {
+      this.authService.handleCallback(code, state);
+    }
+  }
+}
+*/
+
+// ============================================================================
+// 10. POM.XML DEPENDENCIES
+// ============================================================================
+/*
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.microsoft.azure</groupId>
+        <artifactId>msal4j</artifactId>
+        <version>1.13.0</version>
+    </dependency>
+    <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+*/
